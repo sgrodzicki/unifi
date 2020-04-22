@@ -6,29 +6,229 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/elastic/ecs/code/go/ecs"
 	"github.com/golang/snappy"
 	"io"
 	"net"
+	"os"
+	"strconv"
+	"time"
 )
 
-type errUnknownField string
+type Payload struct {
+	InformAsNotif  bool        `json:"inform_as_notif"`
+	Architecture   string      `json:"architecture"`
+	Hostname       string      `json:"hostname"`
+	Serial         string      `json:"serial"`
+	KernelVersion  string      `json:"kernel_version"`
+	BootromVersion string      `json:"bootrom_version"`
+	Version        string      `json:"version"`
+	IP             string      `json:"ip"`
+	MAC            string      `json:"mac"`
+	Uptime         int64       `json:"uptime"`
+	Model          string      `json:"model"`
+	Time           int64       `json:"time"`
+	TimeMs         int64       `json:"time_ms"`
+	SysStats       SysStats    `json:"sys_stats"`
+	SystemStats    SystemStats `json:"system-stats"`
+	Interfaces     []Interface `json:"if_table"`
+}
 
-func (err errUnknownField) Error() string {
-	return fmt.Sprintf("unknown field: %s", string(err))
+type Interface struct {
+	Name      string `json:"name"`
+	RXErrors  int64  `json:"rx_errors"`
+	RXDropped int64  `json:"rx_dropped"`
+	RXPackets int64  `json:"rx_packets"`
+	RXBytes   int64  `json:"rx_bytes"`
+	TXErrors  int64  `json:"tx_errors"`
+	TXDropped int64  `json:"tx_dropped"`
+	TXPackets int64  `json:"tx_packets"`
+	TXBytes   int64  `json:"tx_bytes"`
+}
+
+type SystemStats struct {
+	CPU    string `json:"cpu"`
+	Memory string `json:"mem"`
+	Uptime string `json:"uptime"`
+}
+
+type SysStats struct {
+	Loadavg1  string `json:"loadavg_1"`
+	Loadavg15 string `json:"loadavg_15"`
+	Loadavg5  string `json:"loadavg_5"`
+	MemBuffer int64  `json:"mem_buffer"`
+	MemTotal  int64  `json:"mem_total"`
+	MemUsed   int64  `json:"mem_used"`
+}
+
+func toECS(payload Payload, dataset string, system System) Document {
+	ts := time.Unix(payload.Time, payload.TimeMs*1000).UTC()
+	host, _ := os.Hostname()
+
+	doc := Document{
+		Time: ts,
+		Agent: Agent{
+			Hostname: host,
+			Type:     "github.com/sgrodzicki/unifi",
+			Version:  Version,
+		},
+		ECS: ECS{
+			Version: ecs.Version,
+		},
+		Event: Event{
+			Dataset: dataset,
+			Module:  "system",
+		},
+		Host: Host{
+			Name:         payload.Hostname,
+			Hostname:     payload.Hostname,
+			Architecture: payload.Architecture,
+			OS: OS{
+				Build:    payload.BootromVersion,
+				Family:   "linux", // TODO: Remove hardcoded OS family
+				Kernel:   payload.KernelVersion,
+				Name:     "Linux", // TODO: Remove hardcoded OS name
+				Platform: "linux", // TODO: Remove hardcoded OS platform
+				Version:  payload.Version,
+			},
+			ID:     payload.Serial,
+			IP:     payload.IP,
+			MAC:    payload.MAC,
+			Uptime: payload.Uptime,
+			Type:   payload.Model,
+		},
+		Service: Service{
+			Type: "system",
+		},
+		System: system,
+	}
+
+	return doc
+}
+
+func GenerateCpuDoc(payload Payload) Document {
+	cpu, _ := strconv.ParseFloat(payload.SystemStats.CPU, 64)
+	cpu /= 100
+
+	cores := int64(1) // TODO: Add support for multiple cores
+	system := System{
+		CPU: &CPU{
+			Cores: cores,
+			System: Percentage{
+				Percentage: cpu,
+			},
+		},
+	}
+
+	return toECS(payload, "system.cpu", system)
+}
+
+func GenerateLoadDoc(payload Payload) Document {
+	load1, _ := strconv.ParseFloat(payload.SysStats.Loadavg1, 64)
+	load5, _ := strconv.ParseFloat(payload.SysStats.Loadavg5, 64)
+	load15, _ := strconv.ParseFloat(payload.SysStats.Loadavg15, 64)
+
+	cores := int64(1) // TODO: Add support for multiple cores
+	system := System{
+		Load: &Load{
+			Cores: cores,
+			Normalized: Intervals{
+				OneMinute:     load1 / float64(cores),
+				FiveMinute:    load5 / float64(cores),
+				FifteenMinute: load15 / float64(cores),
+			},
+			Intervals: Intervals{
+				OneMinute:     load1,
+				FiveMinute:    load5,
+				FifteenMinute: load15,
+			},
+		},
+	}
+
+	return toECS(payload, "system.load", system)
+}
+
+func GenerateMemoryDoc(payload Payload) Document {
+	actualPct, _ := strconv.ParseFloat(payload.SystemStats.Memory, 64)
+	actualPct /= 100
+
+	system := System{
+		Memory: &Memory{
+			Actual: MemoryActual{
+				Free: int64(float64(payload.SysStats.MemTotal) * (1 - actualPct)),
+				Used: MemoryUsed{
+					Bytes:      int64(float64(payload.SysStats.MemTotal) * actualPct),
+					Percentage: actualPct,
+				},
+			},
+			Free:  payload.SysStats.MemTotal - payload.SysStats.MemUsed,
+			Total: payload.SysStats.MemTotal,
+			Used: MemoryUsed{
+				Bytes:      payload.SysStats.MemUsed,
+				Percentage: float64(payload.SysStats.MemUsed) / float64(payload.SysStats.MemTotal),
+			},
+		},
+	}
+
+	return toECS(payload, "system.memory", system)
+}
+
+func GenerateNetworkDocs(payload Payload) []Document {
+	var docs []Document
+
+	for _, i := range payload.Interfaces {
+		system := System{
+			Network: &Network{
+				Name: i.Name,
+				In: NetworkCounters{
+					Errors:  i.RXErrors,
+					Dropped: i.RXDropped,
+					Packets: i.RXPackets,
+					Bytes:   i.RXBytes,
+				},
+				Out: NetworkCounters{
+					Errors:  i.TXErrors,
+					Dropped: i.TXDropped,
+					Packets: i.TXPackets,
+					Bytes:   i.TXBytes,
+				},
+			},
+		}
+
+		docs = append(docs, toECS(payload, "system.network", system))
+	}
+
+	return docs
+}
+
+func Decode(key string, packet *Packet) (Payload, error) {
+	payload := Payload{}
+
+	aesKey, err := hex.DecodeString(key)
+	if err != nil || len(aesKey) != 16 {
+		return payload, err
+	}
+
+	data, err := packet.Data(aesKey)
+	if err != nil {
+		return payload, err
+	}
+
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return payload, err
+	}
+
+	return payload, nil
 }
 
 type errInvalidPadding string
 
 func (err errInvalidPadding) Error() string {
 	return fmt.Sprintf("invalid padding: %s", string(err))
-}
-
-type errFlagNotSupported string
-
-func (err errFlagNotSupported) Error() string {
-	return fmt.Sprintf("unsupported flag: %s", string(err))
 }
 
 type errIncompletePacket string
@@ -121,7 +321,7 @@ type Packet struct {
 	AAD            []byte           // additional authenticated data (AAD)
 }
 
-// ReadPacket tries to decode the input into a Packet instance.
+// ParsePayload tries to decode the input into a Packet instance.
 //
 // The reader is read from twice: once to fetch the header (which has a
 // fixed size), and another time to read the body (its length is encoded
@@ -131,7 +331,7 @@ type Packet struct {
 // The returned Packet is nil if there's an error. You should not access
 // its payload directly, but use the Data() function, which takes care
 // of decrypting and decompressing (if necessary).
-func ReadPacket(r io.Reader) (*Packet, error) {
+func ParsePayload(r io.Reader) (*Packet, error) {
 	head := make([]byte, headerLength)
 	n, err := r.Read(head)
 	if err != nil {
@@ -228,17 +428,17 @@ func decryptGCM(key, iv, data, additionalData []byte) ([]byte, error) {
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		panic(err.Error())
+		return nil, err
 	}
 
 	aesgcm, err := cipher.NewGCMWithNonceSize(block, len(iv))
 	if err != nil {
-		panic(err.Error())
+		return nil, err
 	}
 
 	plaintext, err := aesgcm.Open(nil, iv, ciphertext, additionalData)
 	if err != nil {
-		panic(err.Error())
+		return nil, err
 	}
 
 	return plaintext, nil
